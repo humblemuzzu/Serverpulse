@@ -2,21 +2,45 @@ import Cocoa
 import SwiftUI
 
 // ┌──────────────────────────────────────────────────────────────────┐
-// │  ServerPulse — Menu bar server monitor via Tailscale SSH        │
-// │  Inspired by AgentsBar's terminal HUD aesthetic                 │
+// │  ServerPulse — macOS menu bar server monitor via SSH            │
+// │  Configure your server from Settings — no code editing needed   │
 // └──────────────────────────────────────────────────────────────────┘
 
-// MARK: - Configuration
+// MARK: - Static Constants
 struct Config {
-    // ── Edit these for your server ──────────────────────────────────
-    static let sshHost         = "root@your-server"       // Tailscale hostname or user@host
-    static let sshHostFallback = "root@your-server-ip"    // Fallback IP if hostname fails
-    static let serverIP        = "0.0.0.0"                // Your server's public IP
-    static let coolifyURL      = "http://your-server:8000" // Coolify dashboard URL (optional)
-    // ────────────────────────────────────────────────────────────────
-    static let refreshInterval: TimeInterval = 30
-    static let sshTimeout = 12
     static let cardWidth: CGFloat = 340
+}
+
+// MARK: - User Configuration (persisted in UserDefaults)
+class AppConfig {
+    static let shared = AppConfig()
+    private let d = UserDefaults.standard
+
+    var sshHost: String {
+        get { d.string(forKey: "sshHost") ?? "" }
+        set { d.set(newValue, forKey: "sshHost") }
+    }
+    var fallbackHost: String {
+        get { d.string(forKey: "fallbackHost") ?? "" }
+        set { d.set(newValue, forKey: "fallbackHost") }
+    }
+    var serverIP: String {
+        get { d.string(forKey: "serverIP") ?? "" }
+        set { d.set(newValue, forKey: "serverIP") }
+    }
+    var dashboardURL: String {
+        get { d.string(forKey: "dashboardURL") ?? "" }
+        set { d.set(newValue, forKey: "dashboardURL") }
+    }
+    var refreshInterval: Int {
+        get { let v = d.integer(forKey: "refreshInterval"); return v > 0 ? v : 30 }
+        set { d.set(newValue, forKey: "refreshInterval") }
+    }
+    var sshTimeout: Int {
+        get { let v = d.integer(forKey: "sshTimeout"); return v > 0 ? v : 12 }
+        set { d.set(newValue, forKey: "sshTimeout") }
+    }
+    var isConfigured: Bool { !sshHost.isEmpty }
 }
 
 // MARK: - Theme
@@ -26,8 +50,6 @@ struct Theme {
     static let tertiary   = Color.white.opacity(0.28)
     static let border     = Color.white.opacity(0.08)
     static let track      = Color.white.opacity(0.10)
-
-    // Accent — muted cyan for that monitoring-dashboard feel
     static let accent     = Color(red: 0.35, green: 0.82, blue: 0.92)
     static let accentDim  = Color(red: 0.35, green: 0.82, blue: 0.92).opacity(0.20)
     static let warn       = Color(red: 1.0, green: 0.72, blue: 0.30)
@@ -72,7 +94,6 @@ struct ServerData {
 struct ContainerInfo {
     var name, cpuPercent, memUsage, memPercent, netIO, pids: String
     var state, status, image, ports: String
-
     var friendlyName: String {
         if name.count > 30 && name.allSatisfy({ $0.isLowercase || $0.isNumber || $0 == "-" || $0 == "_" }) {
             var img = image.split(separator: "/").last.map(String.init) ?? image
@@ -100,13 +121,11 @@ func fmtBytes(_ b: Int64) -> String {
     if b >= 1024 { return String(format: "%.0f KB", Double(b) / 1024) }
     return "\(b) B"
 }
-
 func fmtRate(_ bps: Double) -> String {
     if bps >= 1_048_576 { return String(format: "%.1f MB/s", bps / 1_048_576) }
     if bps >= 1024 { return String(format: "%.1f KB/s", bps / 1024) }
     return String(format: "%.0f B/s", bps)
 }
-
 func fmtUptime(_ s: Int) -> String {
     let d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
     if d > 0 { return "\(d)d \(h)h \(m)m" }
@@ -117,16 +136,12 @@ func fmtUptime(_ s: Int) -> String {
 // MARK: - SwiftUI Components
 
 struct SegmentedBar: View {
-    let value: Double  // 0–100
-    let segments: Int
-    let tint: Color
-
+    let value: Double; let segments: Int; let tint: Color
     init(_ value: Double, segments: Int = 30, tint: Color? = nil) {
         self.value = min(max(value, 0), 100)
         self.segments = segments
         self.tint = tint ?? Theme.barTint(for: value)
     }
-
     var body: some View {
         HStack(spacing: 1.5) {
             ForEach(0..<segments, id: \.self) { i in
@@ -149,34 +164,22 @@ struct SectionLabel: View {
 }
 
 struct HairlineDivider: View {
-    var body: some View {
-        Rectangle().fill(Theme.border).frame(height: 0.5)
-    }
+    var body: some View { Rectangle().fill(Theme.border).frame(height: 0.5) }
 }
 
 struct MetricLine: View {
-    let label: String
-    let value: String
-    let detail: String?
-
+    let label: String; let value: String; let detail: String?
     init(_ label: String, _ value: String, _ detail: String? = nil) {
         self.label = label; self.value = value; self.detail = detail
     }
-
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 0) {
-            Text(label)
-                .font(Theme.labelFont)
-                .foregroundColor(Theme.secondary)
+            Text(label).font(Theme.labelFont).foregroundColor(Theme.secondary)
                 .frame(width: 90, alignment: .leading)
-            Text(value)
-                .font(Theme.valueFont)
-                .foregroundColor(Theme.primary)
+            Text(value).font(Theme.valueFont).foregroundColor(Theme.primary)
             if let d = detail {
                 Spacer()
-                Text(d)
-                    .font(Theme.smallFont)
-                    .foregroundColor(Theme.tertiary)
+                Text(d).font(Theme.smallFont).foregroundColor(Theme.tertiary)
             }
         }
     }
@@ -184,63 +187,38 @@ struct MetricLine: View {
 
 // MARK: - Server Card View
 struct ServerCardView: View {
-    let data: ServerData
-    let rxRate: Double
-    let txRate: Double
-    let lastUpdate: Date?
-    let healthEmoji: String
+    let data: ServerData; let rxRate: Double; let txRate: Double; let lastUpdate: Date?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            headerSection
-            sectionDivider
-            cpuSection
-            sectionDivider
-            memorySection
-            sectionDivider
-            diskSection
-            sectionDivider
-            networkSection
-            sectionDivider
-            containersSection
-            if !data.topProcesses.isEmpty {
-                sectionDivider
-                processesSection
-            }
+            headerSection; sectionDivider; cpuSection; sectionDivider
+            memorySection; sectionDivider; diskSection; sectionDivider
+            networkSection; sectionDivider; containersSection
+            if !data.topProcesses.isEmpty { sectionDivider; processesSection }
             footerSection
         }
         .frame(width: Config.cardWidth)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 16).padding(.vertical, 10)
     }
 
-    // MARK: Header
     private var headerSection: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                // Pulse dot — animated-feeling
                 Circle()
-                    .fill(data.loadRatio >= 0.9 ? Theme.crit :
-                          data.loadRatio >= 0.7 ? Theme.warn : Theme.accent)
+                    .fill(data.loadRatio >= 0.9 ? Theme.crit : data.loadRatio >= 0.7 ? Theme.warn : Theme.accent)
                     .frame(width: 7, height: 7)
                 Text(data.hostname)
                     .font(.system(size: 13, weight: .semibold, design: .monospaced))
                     .foregroundColor(Theme.primary)
-                Text("·")
-                    .foregroundColor(Theme.tertiary)
+                Text("·").foregroundColor(Theme.tertiary)
                 Text("Up \(fmtUptime(data.uptimeSeconds))")
-                    .font(Theme.labelFont)
-                    .foregroundColor(Theme.secondary)
+                    .font(Theme.labelFont).foregroundColor(Theme.secondary)
             }
             Text("\(data.os) · \(data.kernel) · \(data.cpuCores) cores")
-                .font(Theme.tinyFont)
-                .foregroundColor(Theme.tertiary)
-                .padding(.leading, 15)
-        }
-        .padding(.bottom, 6)
+                .font(Theme.tinyFont).foregroundColor(Theme.tertiary).padding(.leading, 15)
+        }.padding(.bottom, 6)
     }
 
-    // MARK: CPU
     private var cpuSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             SectionLabel(text: "cpu")
@@ -249,16 +227,12 @@ struct ServerCardView: View {
                        "\(f1(data.cpuUser)) usr · \(f1(data.cpuSys)) sys · \(f1(data.cpuWait)) wa")
             HStack(spacing: 8) {
                 SegmentedBar(data.cpuBusy)
-                Text("\(f1(data.cpuBusy))%")
-                    .font(Theme.smallFont)
-                    .foregroundColor(Theme.barTint(for: data.cpuBusy))
-                    .frame(width: 42, alignment: .trailing)
+                Text("\(f1(data.cpuBusy))%").font(Theme.smallFont)
+                    .foregroundColor(Theme.barTint(for: data.cpuBusy)).frame(width: 42, alignment: .trailing)
             }
-        }
-        .padding(.vertical, 8)
+        }.padding(.vertical, 8)
     }
 
-    // MARK: Memory
     private var memorySection: some View {
         VStack(alignment: .leading, spacing: 6) {
             SectionLabel(text: "memory")
@@ -266,27 +240,21 @@ struct ServerCardView: View {
                        "\(fmtBytes(data.memAvailable)) free")
             HStack(spacing: 8) {
                 SegmentedBar(data.memPercent)
-                Text("\(f1(data.memPercent))%")
-                    .font(Theme.smallFont)
-                    .foregroundColor(Theme.barTint(for: data.memPercent))
-                    .frame(width: 42, alignment: .trailing)
+                Text("\(f1(data.memPercent))%").font(Theme.smallFont)
+                    .foregroundColor(Theme.barTint(for: data.memPercent)).frame(width: 42, alignment: .trailing)
             }
             if data.swapTotal > 0 {
                 MetricLine("Swap", "\(fmtBytes(data.swapUsed)) / \(fmtBytes(data.swapTotal))")
                 HStack(spacing: 8) {
                     SegmentedBar(data.swapPercent)
-                    Text("\(f1(data.swapPercent))%")
-                        .font(Theme.smallFont)
-                        .foregroundColor(Theme.barTint(for: data.swapPercent))
-                        .frame(width: 42, alignment: .trailing)
+                    Text("\(f1(data.swapPercent))%").font(Theme.smallFont)
+                        .foregroundColor(Theme.barTint(for: data.swapPercent)).frame(width: 42, alignment: .trailing)
                 }
             }
             MetricLine("Buffers", fmtBytes(data.memBuffCache))
-        }
-        .padding(.vertical, 8)
+        }.padding(.vertical, 8)
     }
 
-    // MARK: Disk
     private var diskSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             SectionLabel(text: "disk")
@@ -294,34 +262,26 @@ struct ServerCardView: View {
                        "\(fmtBytes(data.diskAvail)) free")
             HStack(spacing: 8) {
                 SegmentedBar(data.diskPercentNum)
-                Text(data.diskPercent)
-                    .font(Theme.smallFont)
-                    .foregroundColor(Theme.barTint(for: data.diskPercentNum))
-                    .frame(width: 42, alignment: .trailing)
+                Text(data.diskPercent).font(Theme.smallFont)
+                    .foregroundColor(Theme.barTint(for: data.diskPercentNum)).frame(width: 42, alignment: .trailing)
             }
-        }
-        .padding(.vertical, 8)
+        }.padding(.vertical, 8)
     }
 
-    // MARK: Network
     private var networkSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 SectionLabel(text: "network")
-                Text(data.netIface)
-                    .font(Theme.tinyFont)
-                    .foregroundColor(Theme.tertiary)
+                Text(data.netIface).font(Theme.tinyFont).foregroundColor(Theme.tertiary)
             }
             MetricLine("Conns", "\(data.netConnections) established", "\(data.netListening) listening")
             MetricLine("Total", "↓ \(fmtBytes(data.netRxBytes))  ↑ \(fmtBytes(data.netTxBytes))")
             if rxRate > 0 || txRate > 0 {
                 MetricLine("Rate", "↓ \(fmtRate(rxRate))  ↑ \(fmtRate(txRate))")
             }
-        }
-        .padding(.vertical, 8)
+        }.padding(.vertical, 8)
     }
 
-    // MARK: Containers
     private var containersSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             let running = data.containers.filter(\.isRunning).count
@@ -331,18 +291,11 @@ struct ServerCardView: View {
                     .font(Theme.tinyFont)
                     .foregroundColor(running == data.containers.count ? Theme.accent : Theme.warn)
             }
-
-            // Column header
             HStack(spacing: 0) {
-                Text("    Name")
-                    .frame(width: 160, alignment: .leading)
-                Text("CPU")
-                    .frame(width: 60, alignment: .trailing)
-                Text("MEM")
-                    .frame(width: 80, alignment: .trailing)
-            }
-            .font(Theme.tinyFont)
-            .foregroundColor(Theme.tertiary)
+                Text("    Name").frame(width: 160, alignment: .leading)
+                Text("CPU").frame(width: 60, alignment: .trailing)
+                Text("MEM").frame(width: 80, alignment: .trailing)
+            }.font(Theme.tinyFont).foregroundColor(Theme.tertiary)
 
             ForEach(Array(data.containers.enumerated()), id: \.offset) { _, c in
                 HStack(spacing: 0) {
@@ -350,101 +303,67 @@ struct ServerCardView: View {
                         Circle()
                             .fill(c.isRunning ? Theme.accent.opacity(0.8) : Theme.crit.opacity(0.5))
                             .frame(width: 5, height: 5)
-                        Text(c.friendlyName)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                    }
-                    .frame(width: 160, alignment: .leading)
-
-                    Text(c.cpuPercent)
-                        .frame(width: 60, alignment: .trailing)
-                    Text(c.memShort)
-                        .frame(width: 80, alignment: .trailing)
-                }
-                .font(Theme.smallFont)
+                        Text(c.friendlyName).lineLimit(1).truncationMode(.tail)
+                    }.frame(width: 160, alignment: .leading)
+                    Text(c.cpuPercent).frame(width: 60, alignment: .trailing)
+                    Text(c.memShort).frame(width: 80, alignment: .trailing)
+                }.font(Theme.smallFont)
                 .foregroundColor(c.isRunning ? Theme.primary.opacity(0.85) : Theme.tertiary)
             }
-        }
-        .padding(.vertical, 8)
+        }.padding(.vertical, 8)
     }
 
-    // MARK: Processes
     private var processesSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             SectionLabel(text: "top processes")
-
             HStack(spacing: 0) {
-                Text("Command")
-                    .frame(width: 150, alignment: .leading)
-                Text("CPU")
-                    .frame(width: 55, alignment: .trailing)
-                Text("MEM")
-                    .frame(width: 55, alignment: .trailing)
-                Text("User")
-                    .frame(width: 60, alignment: .trailing)
-            }
-            .font(Theme.tinyFont)
-            .foregroundColor(Theme.tertiary)
-
+                Text("Command").frame(width: 150, alignment: .leading)
+                Text("CPU").frame(width: 55, alignment: .trailing)
+                Text("MEM").frame(width: 55, alignment: .trailing)
+                Text("User").frame(width: 60, alignment: .trailing)
+            }.font(Theme.tinyFont).foregroundColor(Theme.tertiary)
             ForEach(Array(data.topProcesses.prefix(5).enumerated()), id: \.offset) { _, p in
                 HStack(spacing: 0) {
-                    Text(p.shortCommand)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
+                    Text(p.shortCommand).lineLimit(1).truncationMode(.tail)
                         .frame(width: 150, alignment: .leading)
-                    Text("\(f1(p.cpuPercent))%")
-                        .frame(width: 55, alignment: .trailing)
-                    Text("\(f1(p.memPercent))%")
-                        .frame(width: 55, alignment: .trailing)
-                    Text(p.user)
-                        .lineLimit(1)
-                        .frame(width: 60, alignment: .trailing)
-                }
-                .font(Theme.smallFont)
-                .foregroundColor(Theme.primary.opacity(0.75))
+                    Text("\(f1(p.cpuPercent))%").frame(width: 55, alignment: .trailing)
+                    Text("\(f1(p.memPercent))%").frame(width: 55, alignment: .trailing)
+                    Text(p.user).lineLimit(1).frame(width: 60, alignment: .trailing)
+                }.font(Theme.smallFont).foregroundColor(Theme.primary.opacity(0.75))
             }
-        }
-        .padding(.vertical, 8)
+        }.padding(.vertical, 8)
     }
 
-    // MARK: Footer
     private var footerSection: some View {
         VStack(alignment: .leading, spacing: 0) {
             HairlineDivider()
             if let t = lastUpdate {
-                let fmt = { () -> String in
-                    let f = DateFormatter(); f.dateFormat = "h:mm:ss a"; return f.string(from: t)
-                }()
+                let fmt = { () -> String in let f = DateFormatter(); f.dateFormat = "h:mm:ss a"; return f.string(from: t) }()
                 HStack {
                     Spacer()
-                    Text("Updated \(fmt) · every \(Int(Config.refreshInterval))s")
-                        .font(Theme.tinyFont)
-                        .foregroundColor(Theme.tertiary)
+                    Text("Updated \(fmt) · every \(AppConfig.shared.refreshInterval)s")
+                        .font(Theme.tinyFont).foregroundColor(Theme.tertiary)
                     Spacer()
-                }
-                .padding(.top, 8)
+                }.padding(.top, 8)
             }
         }
     }
 
     private var sectionDivider: some View { HairlineDivider() }
-
     private func f1(_ v: Double) -> String { String(format: "%.1f", v) }
     private func f2(_ v: Double) -> String { String(format: "%.2f", v) }
 }
 
-// MARK: - Loading / Error Views
+// MARK: - Status Card Views
+
 struct LoadingCardView: View {
     var body: some View {
         VStack(spacing: 10) {
             SectionLabel(text: "connecting")
-            Text("Waiting for server…")
-                .font(Theme.labelFont)
-                .foregroundColor(Theme.tertiary)
+            Text("Reaching server…")
+                .font(Theme.labelFont).foregroundColor(Theme.tertiary)
         }
-        .frame(width: Config.cardWidth)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 20)
+        .frame(width: Config.cardWidth).padding(.horizontal, 16).padding(.vertical, 20)
     }
 }
 
@@ -453,26 +372,286 @@ struct ErrorCardView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("CONNECTION FAILED")
-                .font(Theme.headerFont)
-                .foregroundColor(Theme.crit)
-                .kerning(1.8)
-            Text(message)
-                .font(Theme.labelFont)
-                .foregroundColor(Theme.secondary)
-            Text("Host: \(Config.sshHost)")
-                .font(Theme.tinyFont)
-                .foregroundColor(Theme.tertiary)
-            Text("Check Tailscale is connected")
-                .font(Theme.tinyFont)
-                .foregroundColor(Theme.tertiary)
+                .font(Theme.headerFont).foregroundColor(Theme.crit).kerning(1.8)
+            Text(message).font(Theme.labelFont).foregroundColor(Theme.secondary)
+            Text("Host: \(AppConfig.shared.sshHost)")
+                .font(Theme.tinyFont).foregroundColor(Theme.tertiary)
+            Text("Check Settings or Tailscale connection")
+                .font(Theme.tinyFont).foregroundColor(Theme.tertiary)
         }
         .frame(width: Config.cardWidth, alignment: .leading)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 16)
+        .padding(.horizontal, 16).padding(.vertical, 16)
     }
 }
 
-// MARK: - Hosting View (kills vibrancy for crisp text)
+struct SetupCardView: View {
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "server.rack")
+                .font(.system(size: 28, weight: .light))
+                .foregroundColor(Theme.accent)
+            Text("SETUP REQUIRED")
+                .font(Theme.headerFont).foregroundColor(Theme.accent).kerning(1.8)
+            Text("Open Settings to configure your server")
+                .font(Theme.labelFont).foregroundColor(Theme.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(width: Config.cardWidth).padding(.horizontal, 16).padding(.vertical, 24)
+    }
+}
+
+// MARK: - Settings View
+
+struct ConfigField: View {
+    let label: String
+    @Binding var text: String
+    var placeholder: String = ""
+    var required: Bool = false
+    var help: String? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 3) {
+                Text(label).font(.system(size: 12, weight: .medium))
+                if required { Text("*").foregroundColor(.red).font(.system(size: 11, weight: .bold)) }
+            }
+            TextField(placeholder, text: $text)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 13, design: .monospaced))
+            if let h = help {
+                Text(h).font(.system(size: 10)).foregroundColor(.secondary)
+            }
+        }
+    }
+}
+
+struct SettingsSectionHeader: View {
+    let title: String
+    var body: some View {
+        Text(title.uppercased())
+            .font(.system(size: 10, weight: .bold, design: .monospaced))
+            .foregroundColor(.secondary)
+            .kerning(1.5)
+    }
+}
+
+struct SettingsView: View {
+    @State private var sshHost: String
+    @State private var fallback: String
+    @State private var serverIP: String
+    @State private var dashURL: String
+    @State private var refreshSec: Int
+    @State private var timeoutSec: Int
+    @State private var testStatus: String?
+    @State private var isTesting = false
+
+    let onSave: () -> Void
+    let onCancel: () -> Void
+
+    init(onSave: @escaping () -> Void, onCancel: @escaping () -> Void) {
+        let c = AppConfig.shared
+        _sshHost = State(initialValue: c.sshHost)
+        _fallback = State(initialValue: c.fallbackHost)
+        _serverIP = State(initialValue: c.serverIP)
+        _dashURL = State(initialValue: c.dashboardURL)
+        _refreshSec = State(initialValue: c.refreshInterval)
+        _timeoutSec = State(initialValue: c.sshTimeout)
+        self.onSave = onSave
+        self.onCancel = onCancel
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header
+            HStack(spacing: 10) {
+                Image(systemName: "waveform.path.ecg")
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(Color(red: 0.35, green: 0.82, blue: 0.92))
+                Text("ServerPulse")
+                    .font(.system(size: 18, weight: .semibold))
+            }
+            .padding(.bottom, 20)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    // Connection
+                    VStack(alignment: .leading, spacing: 12) {
+                        SettingsSectionHeader(title: "connection")
+
+                        ConfigField(label: "SSH Host", text: $sshHost,
+                                    placeholder: "root@my-server",
+                                    required: true,
+                                    help: "Tailscale hostname or user@ip for SSH")
+
+                        // Test button
+                        HStack(spacing: 10) {
+                            Button(action: testConnection) {
+                                HStack(spacing: 4) {
+                                    if isTesting {
+                                        ProgressView().scaleEffect(0.6)
+                                    } else {
+                                        Image(systemName: "bolt.fill").font(.system(size: 10))
+                                    }
+                                    Text("Test Connection")
+                                }
+                            }
+                            .disabled(sshHost.isEmpty || isTesting)
+                            .font(.system(size: 11))
+
+                            if let status = testStatus {
+                                Text(status)
+                                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                    .foregroundColor(status.contains("✓") ? .green : .red)
+                            }
+                        }
+
+                        ConfigField(label: "Fallback Host", text: $fallback,
+                                    placeholder: "root@1.2.3.4",
+                                    help: "Optional — used if primary host is unreachable")
+                    }
+
+                    Divider()
+
+                    // Server info
+                    VStack(alignment: .leading, spacing: 12) {
+                        SettingsSectionHeader(title: "server info")
+                        ConfigField(label: "Public IP", text: $serverIP,
+                                    placeholder: "1.2.3.4",
+                                    help: "For the \"Copy Server IP\" action")
+                        ConfigField(label: "Dashboard URL", text: $dashURL,
+                                    placeholder: "http://my-server:8000",
+                                    help: "Coolify, Portainer, or any admin dashboard")
+                    }
+
+                    Divider()
+
+                    // Monitoring
+                    VStack(alignment: .leading, spacing: 12) {
+                        SettingsSectionHeader(title: "monitoring")
+
+                        HStack {
+                            Text("Refresh every").font(.system(size: 12, weight: .medium))
+                            Spacer()
+                            Stepper(value: $refreshSec, in: 10...300, step: 10) {
+                                Text("\(refreshSec)s")
+                                    .font(.system(size: 13, weight: .medium, design: .monospaced))
+                                    .frame(width: 40, alignment: .trailing)
+                            }
+                        }
+                        Text("How often to poll the server")
+                            .font(.system(size: 10)).foregroundColor(.secondary)
+
+                        HStack {
+                            Text("SSH timeout").font(.system(size: 12, weight: .medium))
+                            Spacer()
+                            Stepper(value: $timeoutSec, in: 5...60, step: 5) {
+                                Text("\(timeoutSec)s")
+                                    .font(.system(size: 13, weight: .medium, design: .monospaced))
+                                    .frame(width: 40, alignment: .trailing)
+                            }
+                        }
+                        Text("Max wait before marking connection failed")
+                            .font(.system(size: 10)).foregroundColor(.secondary)
+                    }
+                }
+            }
+
+            Spacer(minLength: 16)
+
+            // Buttons
+            Divider().padding(.bottom, 12)
+            HStack {
+                Spacer()
+                Button("Cancel") { onCancel() }
+                    .keyboardShortcut(.escape)
+                Button(action: save) {
+                    Text("Save & Connect")
+                }
+                .keyboardShortcut(.return)
+                .buttonStyle(.borderedProminent)
+                .tint(Color(red: 0.35, green: 0.82, blue: 0.92))
+                .disabled(sshHost.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 460, height: 580)
+    }
+
+    private func save() {
+        let c = AppConfig.shared
+        c.sshHost = sshHost.trimmingCharacters(in: .whitespaces)
+        c.fallbackHost = fallback.trimmingCharacters(in: .whitespaces)
+        c.serverIP = serverIP.trimmingCharacters(in: .whitespaces)
+        c.dashboardURL = dashURL.trimmingCharacters(in: .whitespaces)
+        c.refreshInterval = refreshSec
+        c.sshTimeout = timeoutSec
+        onSave()
+    }
+
+    private func testConnection() {
+        guard !sshHost.isEmpty else { return }
+        isTesting = true
+        testStatus = nil
+        let host = sshHost.trimmingCharacters(in: .whitespaces)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ok = sshTest(host: host)
+            DispatchQueue.main.async {
+                isTesting = false
+                testStatus = ok ? "✓ Connected" : "✗ Failed — check host or Tailscale"
+            }
+        }
+    }
+}
+
+func sshTest(host: String) -> Bool {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+    p.arguments = ["-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new",
+                   "-o", "BatchMode=yes", host, "echo PULSE_OK"]
+    let pipe = Pipe()
+    p.standardOutput = pipe; p.standardError = Pipe()
+    do { try p.run(); p.waitUntilExit() } catch { return false }
+    guard p.terminationStatus == 0 else { return false }
+    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return out.contains("PULSE_OK")
+}
+
+// MARK: - Settings Window Controller
+class SettingsWindowController {
+    private var window: NSWindow?
+
+    func show(onSave: @escaping () -> Void) {
+        if let w = window, w.isVisible {
+            w.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let view = SettingsView(
+            onSave: { [weak self] in self?.window?.close(); onSave() },
+            onCancel: { [weak self] in self?.window?.close() }
+        )
+
+        let hosting = NSHostingView(rootView: view)
+        let w = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 580),
+            styleMask: [.titled, .closable],
+            backing: .buffered, defer: false
+        )
+        w.title = "ServerPulse Settings"
+        w.contentView = hosting
+        w.center()
+        w.isReleasedWhenClosed = false
+        w.appearance = NSAppearance(named: .darkAqua)
+        w.titlebarAppearsTransparent = true
+        w.backgroundColor = NSColor(red: 0.12, green: 0.12, blue: 0.14, alpha: 1)
+        w.makeKeyAndOrderFront(nil)
+        self.window = w
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+// MARK: - Hosting View
 class CardHostingView<Content: View>: NSHostingView<Content> {
     override var allowsVibrancy: Bool { false }
 }
@@ -482,7 +661,6 @@ func makePulseIcon() -> NSImage {
     let w: CGFloat = 18, h: CGFloat = 18
     let image = NSImage(size: NSSize(width: w, height: h), flipped: false) { _ in
         let path = NSBezierPath()
-        // EKG / heartbeat waveform
         path.move(to: NSPoint(x: 1, y: 9))
         path.line(to: NSPoint(x: 4.5, y: 9))
         path.line(to: NSPoint(x: 6.5, y: 14))
@@ -536,27 +714,18 @@ class ServerMonitor {
     echo "===END_TOP_PROCS==="
     """
 
-    enum Health { case green, yellow, red }
-
-    var health: Health {
-        guard let d = data else { return lastError != nil ? .red : .green }
-        if d.loadRatio >= 0.90 || d.memPercent >= 90 || d.diskPercentNum >= 90 { return .red }
-        if d.loadRatio >= 0.70 || d.memPercent >= 80 || d.diskPercentNum >= 80 { return .yellow }
-        return .green
-    }
-
     func refresh(completion: @escaping (Bool) -> Void) {
+        let cfg = AppConfig.shared
+        guard cfg.isConfigured else { lastError = "Not configured"; completion(false); return }
         guard !isLoading else { completion(false); return }
         isLoading = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            let out = self.ssh(Config.sshHost) ?? self.ssh(Config.sshHostFallback)
+            let out = self.ssh(cfg.sshHost) ?? (cfg.fallbackHost.isEmpty ? nil : self.ssh(cfg.fallbackHost))
             DispatchQueue.main.async {
                 self.isLoading = false
                 if let out = out {
-                    self.parse(out)
-                    self.lastUpdate = Date()
-                    self.lastError = nil
+                    self.parse(out); self.lastUpdate = Date(); self.lastError = nil
                     completion(true)
                 } else {
                     self.lastError = "SSH connection timed out"
@@ -566,10 +735,13 @@ class ServerMonitor {
         }
     }
 
+    func reset() { data = nil; lastError = nil; lastUpdate = nil; rxRate = 0; txRate = 0 }
+
     private func ssh(_ host: String) -> String? {
+        let cfg = AppConfig.shared
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        p.arguments = ["-o", "ConnectTimeout=\(Config.sshTimeout)",
+        p.arguments = ["-o", "ConnectTimeout=\(cfg.sshTimeout)",
                        "-o", "StrictHostKeyChecking=accept-new",
                        "-o", "BatchMode=yes", host, script]
         let pipe = Pipe(); let err = Pipe()
@@ -583,17 +755,16 @@ class ServerMonitor {
         var d = ServerData()
         var dStats: [String] = [], dInfo: [String] = [], procs: [String] = []
         var section = ""
-
         for line in output.components(separatedBy: "\n") {
             let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if t.isEmpty { continue }
             switch t {
-            case "===DOCKER_STATS===":     section = "ds"; continue
+            case "===DOCKER_STATS===": section = "ds"; continue
             case "===END_DOCKER_STATS===": section = ""; continue
-            case "===DOCKER_INFO===":      section = "di"; continue
-            case "===END_DOCKER_INFO===":  section = ""; continue
-            case "===TOP_PROCS===":        section = "tp"; continue
-            case "===END_TOP_PROCS===":    section = ""; continue
+            case "===DOCKER_INFO===": section = "di"; continue
+            case "===END_DOCKER_INFO===": section = ""; continue
+            case "===TOP_PROCS===": section = "tp"; continue
+            case "===END_TOP_PROCS===": section = ""; continue
             default: break
             }
             switch section {
@@ -602,22 +773,17 @@ class ServerMonitor {
             case "tp": procs.append(t)
             default:
                 if let eq = t.firstIndex(of: "=") {
-                    let k = String(t[..<eq]), v = String(t[t.index(after: eq)...])
-                    set(key: k, val: v, d: &d)
+                    set(key: String(t[..<eq]), val: String(t[t.index(after: eq)...]), d: &d)
                 }
             }
         }
-
-        // Docker stats map
         var sm: [String: (String,String,String,String,String)] = [:]
         for l in dStats {
-            let p = l.components(separatedBy: "|")
-            guard p.count >= 6 else { continue }
+            let p = l.components(separatedBy: "|"); guard p.count >= 6 else { continue }
             sm[p[0]] = (p[1],p[2],p[3],p[4],p[5])
         }
         for l in dInfo {
-            let p = l.components(separatedBy: "|")
-            guard p.count >= 4 else { continue }
+            let p = l.components(separatedBy: "|"); guard p.count >= 4 else { continue }
             let s = sm[p[0]]
             d.containers.append(ContainerInfo(
                 name: p[0], cpuPercent: s?.0 ?? "--", memUsage: s?.1 ?? "--",
@@ -628,17 +794,13 @@ class ServerMonitor {
             if a.isRunning != b.isRunning { return a.isRunning }
             return a.friendlyName.lowercased() < b.friendlyName.lowercased()
         }
-
         for l in procs {
-            let p = l.components(separatedBy: "|")
-            guard p.count >= 4 else { continue }
+            let p = l.components(separatedBy: "|"); guard p.count >= 4 else { continue }
             let pi = ProcessInfo(user: p[0], cpuPercent: Double(p[1]) ?? 0,
                                  memPercent: Double(p[2]) ?? 0,
                                  command: p[3].trimmingCharacters(in: .whitespaces))
             if pi.cpuPercent > 0 || pi.memPercent > 0.5 { d.topProcesses.append(pi) }
         }
-
-        // Bandwidth rate
         if d.netRxBytes > 0, let pt = prevTime {
             let elapsed = Date().timeIntervalSince(pt)
             if elapsed > 1 {
@@ -652,33 +814,33 @@ class ServerMonitor {
 
     private func set(key k: String, val v: String, d: inout ServerData) {
         switch k {
-        case "HOSTNAME":       d.hostname = v
-        case "UPTIME_S":       d.uptimeSeconds = Int(v) ?? 0
-        case "LOAD_1":         d.load1 = Double(v) ?? 0
-        case "LOAD_5":         d.load5 = Double(v) ?? 0
-        case "LOAD_15":        d.load15 = Double(v) ?? 0
-        case "CPU_CORES":      d.cpuCores = Int(v) ?? 1
-        case "CPU_USER":       d.cpuUser = Double(v) ?? 0
-        case "CPU_SYS":        d.cpuSys = Double(v) ?? 0
-        case "CPU_IDLE":       d.cpuIdle = Double(v) ?? 100
-        case "CPU_WAIT":       d.cpuWait = Double(v) ?? 0
-        case "MEM_TOTAL":      d.memTotal = Int64(v) ?? 0
-        case "MEM_USED":       d.memUsed = Int64(v) ?? 0
-        case "MEM_AVAILABLE":  d.memAvailable = Int64(v) ?? 0
+        case "HOSTNAME": d.hostname = v
+        case "UPTIME_S": d.uptimeSeconds = Int(v) ?? 0
+        case "LOAD_1": d.load1 = Double(v) ?? 0
+        case "LOAD_5": d.load5 = Double(v) ?? 0
+        case "LOAD_15": d.load15 = Double(v) ?? 0
+        case "CPU_CORES": d.cpuCores = Int(v) ?? 1
+        case "CPU_USER": d.cpuUser = Double(v) ?? 0
+        case "CPU_SYS": d.cpuSys = Double(v) ?? 0
+        case "CPU_IDLE": d.cpuIdle = Double(v) ?? 100
+        case "CPU_WAIT": d.cpuWait = Double(v) ?? 0
+        case "MEM_TOTAL": d.memTotal = Int64(v) ?? 0
+        case "MEM_USED": d.memUsed = Int64(v) ?? 0
+        case "MEM_AVAILABLE": d.memAvailable = Int64(v) ?? 0
         case "MEM_BUFF_CACHE": d.memBuffCache = Int64(v) ?? 0
-        case "SWAP_TOTAL":     d.swapTotal = Int64(v) ?? 0
-        case "SWAP_USED":      d.swapUsed = Int64(v) ?? 0
-        case "DISK_TOTAL":     d.diskTotal = Int64(v) ?? 0
-        case "DISK_USED":      d.diskUsed = Int64(v) ?? 0
-        case "DISK_AVAIL":     d.diskAvail = Int64(v) ?? 0
-        case "DISK_PERCENT":   d.diskPercent = v
-        case "NET_CONN":       d.netConnections = Int(v) ?? 0
-        case "NET_LISTEN":     d.netListening = Int(v) ?? 0
-        case "NET_IFACE":      d.netIface = v
-        case "NET_RX":         d.netRxBytes = Int64(v) ?? 0
-        case "NET_TX":         d.netTxBytes = Int64(v) ?? 0
-        case "KERNEL":         d.kernel = v
-        case "OS":             d.os = v
+        case "SWAP_TOTAL": d.swapTotal = Int64(v) ?? 0
+        case "SWAP_USED": d.swapUsed = Int64(v) ?? 0
+        case "DISK_TOTAL": d.diskTotal = Int64(v) ?? 0
+        case "DISK_USED": d.diskUsed = Int64(v) ?? 0
+        case "DISK_AVAIL": d.diskAvail = Int64(v) ?? 0
+        case "DISK_PERCENT": d.diskPercent = v
+        case "NET_CONN": d.netConnections = Int(v) ?? 0
+        case "NET_LISTEN": d.netListening = Int(v) ?? 0
+        case "NET_IFACE": d.netIface = v
+        case "NET_RX": d.netRxBytes = Int64(v) ?? 0
+        case "NET_TX": d.netTxBytes = Int64(v) ?? 0
+        case "KERNEL": d.kernel = v
+        case "OS": d.os = v
         default: break
         }
     }
@@ -690,35 +852,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let monitor = ServerMonitor()
     var timer: Timer?
     let pulseIcon = makePulseIcon()
+    let settingsController = SettingsWindowController()
 
     func applicationDidFinishLaunching(_ n: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = statusItem.button {
             btn.image = pulseIcon
             btn.imagePosition = .imageLeft
-            btn.title = " …"
+            btn.title = " –"
             btn.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
         }
         rebuildMenu()
-        timer = Timer.scheduledTimer(withTimeInterval: Config.refreshInterval, repeats: true) { [weak self] _ in
-            self?.doRefresh()
+
+        if AppConfig.shared.isConfigured {
+            startMonitoring()
+        } else {
+            // First launch — open settings
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.openSettings()
+            }
         }
-        doRefresh()
     }
 
     func applicationWillTerminate(_ n: Notification) { timer?.invalidate() }
 
-    private func doRefresh() {
-        if let btn = statusItem.button { btn.title = " …" }
+    private func startMonitoring() {
+        timer?.invalidate()
+        monitor.reset()
+        updateTitle(loading: true)
         monitor.refresh { [weak self] _ in self?.updateUI() }
+        timer = Timer.scheduledTimer(withTimeInterval: TimeInterval(AppConfig.shared.refreshInterval),
+                                     repeats: true) { [weak self] _ in
+            self?.monitor.refresh { [weak self] _ in self?.updateUI() }
+        }
     }
 
     private func updateUI() {
         rebuildMenu()
+        updateTitle(loading: false)
+    }
+
+    private func updateTitle(loading: Bool) {
         guard let btn = statusItem.button else { return }
+        if loading { btn.title = " …"; return }
         if let d = monitor.data {
-            let load = String(format: " %.2f", d.load1)
-            btn.title = load
+            btn.title = String(format: " %.2f", d.load1)
+        } else if !AppConfig.shared.isConfigured {
+            btn.title = " –"
         } else {
             btn.title = " ✕"
         }
@@ -731,41 +911,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Stats card
         let cardItem = NSMenuItem()
-        if let d = monitor.data {
-            let view = ServerCardView(data: d, rxRate: monitor.rxRate, txRate: monitor.txRate,
-                                      lastUpdate: monitor.lastUpdate, healthEmoji: "")
-            let hosting = CardHostingView(rootView: view)
-            hosting.frame.size = hosting.fittingSize
-            cardItem.view = hosting
-        } else if monitor.lastError != nil {
-            let hosting = CardHostingView(rootView: ErrorCardView(message: monitor.lastError!))
-            hosting.frame.size = hosting.fittingSize
-            cardItem.view = hosting
+        if !AppConfig.shared.isConfigured {
+            let h = CardHostingView(rootView: SetupCardView())
+            h.frame.size = h.fittingSize; cardItem.view = h
+        } else if let d = monitor.data {
+            let v = ServerCardView(data: d, rxRate: monitor.rxRate, txRate: monitor.txRate, lastUpdate: monitor.lastUpdate)
+            let h = CardHostingView(rootView: v)
+            h.frame.size = h.fittingSize; cardItem.view = h
+        } else if let err = monitor.lastError, err != "Not configured" {
+            let h = CardHostingView(rootView: ErrorCardView(message: err))
+            h.frame.size = h.fittingSize; cardItem.view = h
         } else {
-            let hosting = CardHostingView(rootView: LoadingCardView())
-            hosting.frame.size = hosting.fittingSize
-            cardItem.view = hosting
+            let h = CardHostingView(rootView: LoadingCardView())
+            h.frame.size = h.fittingSize; cardItem.view = h
         }
         menu.addItem(cardItem)
-
         menu.addItem(.separator())
 
-        // Action items — clean, standard menu items
-        let refresh = NSMenuItem(title: "  ↻  Refresh Now", action: #selector(refreshAction), keyEquivalent: "r")
-        refresh.target = self
-        menu.addItem(refresh)
+        // Actions
+        if AppConfig.shared.isConfigured {
+            let refresh = NSMenuItem(title: "  ↻  Refresh Now", action: #selector(refreshAction), keyEquivalent: "r")
+            refresh.target = self; menu.addItem(refresh)
 
-        let terminal = NSMenuItem(title: "  ⌨  Open Terminal", action: #selector(terminalAction), keyEquivalent: "t")
-        terminal.target = self
-        menu.addItem(terminal)
+            let terminal = NSMenuItem(title: "  ⌨  Open Terminal", action: #selector(terminalAction), keyEquivalent: "t")
+            terminal.target = self; menu.addItem(terminal)
 
-        let coolify = NSMenuItem(title: "  ◉  Coolify Dashboard", action: #selector(coolifyAction), keyEquivalent: "d")
-        coolify.target = self
-        menu.addItem(coolify)
+            if !AppConfig.shared.dashboardURL.isEmpty {
+                let dash = NSMenuItem(title: "  ◉  Open Dashboard", action: #selector(dashAction), keyEquivalent: "d")
+                dash.target = self; menu.addItem(dash)
+            }
+            if !AppConfig.shared.serverIP.isEmpty {
+                let ip = NSMenuItem(title: "  ⧉  Copy Server IP", action: #selector(copyIPAction), keyEquivalent: "")
+                ip.target = self; menu.addItem(ip)
+            }
+            menu.addItem(.separator())
+        }
 
-        let ip = NSMenuItem(title: "  ⧉  Copy Server IP", action: #selector(copyIPAction), keyEquivalent: "")
-        ip.target = self
-        menu.addItem(ip)
+        let settings = NSMenuItem(title: "  ⚙  Settings…", action: #selector(settingsAction), keyEquivalent: ",")
+        settings.target = self; menu.addItem(settings)
 
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "  Quit ServerPulse", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -773,20 +956,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    @objc func refreshAction() { doRefresh() }
+    // MARK: Actions
+
+    @objc func refreshAction() { updateTitle(loading: true); monitor.refresh { [weak self] _ in self?.updateUI() } }
 
     @objc func terminalAction() {
-        let src = "tell application \"Terminal\"\nactivate\ndo script \"ssh \(Config.sshHost)\"\nend tell"
+        let host = AppConfig.shared.sshHost
+        let src = "tell application \"Terminal\"\nactivate\ndo script \"ssh \(host)\"\nend tell"
         if let s = NSAppleScript(source: src) { var e: NSDictionary?; s.executeAndReturnError(&e) }
     }
 
-    @objc func coolifyAction() {
-        if let u = URL(string: Config.coolifyURL) { NSWorkspace.shared.open(u) }
+    @objc func dashAction() {
+        if let u = URL(string: AppConfig.shared.dashboardURL) { NSWorkspace.shared.open(u) }
     }
 
     @objc func copyIPAction() {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(Config.serverIP, forType: .string)
+        NSPasteboard.general.setString(AppConfig.shared.serverIP, forType: .string)
+    }
+
+    @objc func settingsAction() { openSettings() }
+
+    private func openSettings() {
+        settingsController.show { [weak self] in
+            self?.startMonitoring()
+            self?.rebuildMenu()
+        }
     }
 }
 

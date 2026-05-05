@@ -1,7 +1,6 @@
 #!/bin/bash
 
 APP_NAME="ServerPulse"
-BUNDLE_ID="com.muzammil.serverpulse"
 OUTPUT_DIR="./build"
 APP_PATH="$OUTPUT_DIR/$APP_NAME.app"
 
@@ -22,9 +21,15 @@ swiftc -O \
 
 if [ $? -eq 0 ]; then
     echo "✅ Build successful!"
-    echo "📍 App location: $APP_PATH"
     echo ""
-    echo "To run:  open \"$APP_PATH\""
+
+    # Install to ~/Applications for Spotlight & Raycast
+    mkdir -p ~/Applications
+    cp -R "$APP_PATH" ~/Applications/
+    echo "📦 Installed to ~/Applications/ServerPulse.app"
+    echo "   → Searchable in Spotlight and Raycast"
+    echo ""
+    echo "To run:  open ~/Applications/ServerPulse.app"
     echo ""
     echo "To auto-start on login:"
     echo "  System Settings → General → Login Items → add ServerPulse"
