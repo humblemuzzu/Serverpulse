@@ -763,8 +763,15 @@ class ServerMonitor {
     private(set) var lastError: String?
     private(set) var lastUpdate: Date?
     private(set) var isLoading = false
+    private(set) var isReauthing = false
+    private(set) var consecutiveFailures = 0
+    private var lastReauthAttempt: Date?
     private var prevRx: Int64 = 0, prevTx: Int64 = 0, prevTime: Date?
     private(set) var rxRate = 0.0, txRate = 0.0
+    var onReauthStateChange: (() -> Void)?
+
+    // Cooldown between auto-reauth attempts (seconds)
+    private let reauthCooldown: TimeInterval = 120
 
     private let script = """
     echo "HOSTNAME=$(hostname)" && \\
@@ -795,38 +802,187 @@ class ServerMonitor {
     func refresh(completion: @escaping (Bool) -> Void) {
         let cfg = AppConfig.shared
         guard cfg.isConfigured else { lastError = "Not configured"; completion(false); return }
-        guard !isLoading else { completion(false); return }
+        guard !isLoading, !isReauthing else { completion(false); return }
         isLoading = true
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            let out = self.ssh(cfg.sshHost) ?? (cfg.fallbackHost.isEmpty ? nil : self.ssh(cfg.fallbackHost))
-            DispatchQueue.main.async {
-                self.isLoading = false
-                if let out = out {
-                    self.parse(out); self.lastUpdate = Date(); self.lastError = nil
+
+            // 1. Try BatchMode (fast, non-blocking)
+            let out = self.sshBatch(cfg.sshHost)
+                ?? (cfg.fallbackHost.isEmpty ? nil : self.sshBatch(cfg.fallbackHost))
+
+            if let out = out {
+                // Success — parse and update
+                DispatchQueue.main.async {
+                    self.isLoading = false
+                    self.consecutiveFailures = 0
+                    self.parse(out)
+                    self.lastUpdate = Date()
+                    self.lastError = nil
                     completion(true)
-                } else {
-                    self.lastError = "SSH connection timed out"
+                }
+                return
+            }
+
+            // 2. BatchMode failed — check if we should auto-reauth
+            self.consecutiveFailures += 1
+            let shouldAutoReauth = self.consecutiveFailures >= 2
+                && (self.lastReauthAttempt == nil
+                    || Date().timeIntervalSince(self.lastReauthAttempt!) > self.reauthCooldown)
+
+            if shouldAutoReauth {
+                DispatchQueue.main.async {
+                    self.isLoading = false
+                    self.isReauthing = true
+                    self.lastReauthAttempt = Date()
+                    self.lastError = "Tailscale auth expired — opening browser…"
+                    self.onReauthStateChange?()
+                }
+                // 3. Try without BatchMode — captures Tailscale URL, opens browser
+                self.sshReauth(cfg.sshHost) { ok in
+                    DispatchQueue.main.async {
+                        self.isReauthing = false
+                        if ok {
+                            self.consecutiveFailures = 0
+                            self.lastError = nil
+                            self.onReauthStateChange?()
+                            // Re-fetch full data now that auth works
+                            self.isLoading = true
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                let fullOut = self.sshBatch(cfg.sshHost)
+                                DispatchQueue.main.async {
+                                    self.isLoading = false
+                                    if let fullOut = fullOut {
+                                        self.parse(fullOut)
+                                        self.lastUpdate = Date()
+                                        self.lastError = nil
+                                    }
+                                    completion(ok)
+                                }
+                            }
+                        } else {
+                            self.lastError = "Re-authentication failed or timed out"
+                            self.onReauthStateChange?()
+                            completion(false)
+                        }
+                    }
+                }
+            } else {
+                DispatchQueue.main.async {
+                    self.isLoading = false
+                    if self.isReauthing {
+                        // Don't overwrite reauth state
+                    } else if self.consecutiveFailures == 1 {
+                        self.lastError = "SSH connection failed — retrying…"
+                    } else {
+                        self.lastError = "SSH connection failed (\(self.consecutiveFailures) attempts)"
+                    }
                     completion(false)
                 }
             }
         }
     }
 
-    func reset() { data = nil; lastError = nil; lastUpdate = nil; rxRate = 0; txRate = 0 }
+    /// Manual reauth triggered by user clicking the button
+    func manualReauth(completion: @escaping (Bool) -> Void) {
+        let cfg = AppConfig.shared
+        guard cfg.isConfigured, !isReauthing else { completion(false); return }
+        isReauthing = true
+        lastReauthAttempt = Date()
+        lastError = "Authenticating — check your browser…"
+        onReauthStateChange?()
 
-    private func ssh(_ host: String) -> String? {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            self.sshReauth(cfg.sshHost) { ok in
+                DispatchQueue.main.async {
+                    self.isReauthing = false
+                    if ok {
+                        self.consecutiveFailures = 0
+                        self.lastError = nil
+                    } else {
+                        self.lastError = "Re-authentication failed — try again"
+                    }
+                    self.onReauthStateChange?()
+                    completion(ok)
+                }
+            }
+        }
+    }
+
+    func reset() {
+        data = nil; lastError = nil; lastUpdate = nil
+        rxRate = 0; txRate = 0; consecutiveFailures = 0
+    }
+
+    // MARK: SSH Methods
+
+    /// BatchMode SSH — fast, fails immediately if auth is needed. Hard timeout kills hung processes.
+    private func sshBatch(_ host: String) -> String? {
         let cfg = AppConfig.shared
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         p.arguments = ["-o", "ConnectTimeout=\(cfg.sshTimeout)",
                        "-o", "StrictHostKeyChecking=accept-new",
-                       "-o", "BatchMode=yes", host, script]
-        let pipe = Pipe(); let err = Pipe()
-        p.standardOutput = pipe; p.standardError = err
-        do { try p.run(); p.waitUntilExit() } catch { return nil }
+                       "-o", "BatchMode=yes",
+                       "-o", "ServerAliveInterval=5",
+                       "-o", "ServerAliveCountMax=2",
+                       host, script]
+        let pipe = Pipe(); let errPipe = Pipe()
+        p.standardOutput = pipe; p.standardError = errPipe
+        do { try p.run() } catch { return nil }
+
+        // Hard timeout: kill the process if it hangs (Tailscale can hold connections open)
+        let hardTimeout = cfg.sshTimeout + 8
+        DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(hardTimeout)) {
+            if p.isRunning { p.terminate() }
+        }
+
+        p.waitUntilExit()
         guard p.terminationStatus == 0 else { return nil }
         return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+    }
+
+    /// Non-BatchMode SSH — allows Tailscale to print auth URL. Captures it and opens browser.
+    private func sshReauth(_ host: String, completion: @escaping (Bool) -> Void) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        p.arguments = ["-o", "ConnectTimeout=30",
+                       "-o", "StrictHostKeyChecking=accept-new",
+                       host, "echo PULSE_OK"]
+        let outPipe = Pipe(); let errPipe = Pipe()
+        p.standardOutput = outPipe; p.standardError = errPipe
+        p.standardInput = Pipe() // empty stdin — no password prompts
+
+        var authURLOpened = false
+        errPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            for line in text.components(separatedBy: "\n") {
+                if !authURLOpened, line.contains("tailscale.com") || line.contains("login.") {
+                    let words = line.components(separatedBy: .whitespaces)
+                    for word in words {
+                        if word.hasPrefix("https://"), let url = URL(string: word) {
+                            authURLOpened = true
+                            DispatchQueue.main.async { NSWorkspace.shared.open(url) }
+                            break
+                        }
+                    }
+                }
+            }
+        }
+
+        do { try p.run() } catch { completion(false); return }
+
+        // Kill after 90s if user doesn't approve
+        DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(90)) {
+            if p.isRunning { p.terminate() }
+        }
+
+        p.waitUntilExit()
+        errPipe.fileHandleForReading.readabilityHandler = nil
+        completion(p.terminationStatus == 0)
     }
 
     private func parse(_ output: String) {
@@ -931,7 +1087,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var timer: Timer?
     let pulseIcon = makePulseIcon()
     let settingsController = SettingsWindowController()
-    var isReauthing = false
 
     func applicationDidFinishLaunching(_ n: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -941,12 +1096,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             btn.title = " –"
             btn.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
         }
+
+        // When monitor's reauth state changes, rebuild the menu immediately
+        monitor.onReauthStateChange = { [weak self] in self?.updateUI() }
+
         rebuildMenu()
 
         if AppConfig.shared.isConfigured {
             startMonitoring()
         } else {
-            // First launch — open settings
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 self?.openSettings()
             }
@@ -998,7 +1156,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let h = CardHostingView(rootView: v)
             h.frame.size = h.fittingSize; cardItem.view = h
         } else if let err = monitor.lastError, err != "Not configured" {
-            let h = CardHostingView(rootView: ErrorCardView(message: err, isReauthing: isReauthing))
+            let h = CardHostingView(rootView: ErrorCardView(message: err, isReauthing: monitor.isReauthing))
             h.frame.size = h.fittingSize; cardItem.view = h
         } else {
             let h = CardHostingView(rootView: LoadingCardView())
@@ -1013,8 +1171,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             refresh.target = self; menu.addItem(refresh)
 
             // Show re-authenticate when connection is failing
-            if monitor.lastError != nil || isReauthing {
-                if isReauthing {
+            if monitor.lastError != nil || monitor.isReauthing {
+                if monitor.isReauthing {
                     let authItem = NSMenuItem(title: "  🔑  Authenticating… (check browser)", action: nil, keyEquivalent: "")
                     authItem.isEnabled = false
                     menu.addItem(authItem)
@@ -1067,22 +1225,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func reauthAction() {
-        guard !isReauthing else { return }
-        isReauthing = true
-        rebuildMenu()
         updateTitle(loading: true)
-
-        let host = AppConfig.shared.sshHost
-        reauthSSH(host: host, timeout: 90) { [weak self] ok in
+        rebuildMenu()
+        monitor.manualReauth { [weak self] ok in
             guard let self = self else { return }
-            self.isReauthing = false
             if ok {
-                // Auth succeeded — restart normal monitoring
                 self.startMonitoring()
             } else {
-                self.monitor.reset()
-                self.rebuildMenu()
-                self.updateTitle(loading: false)
+                self.updateUI()
             }
         }
     }
