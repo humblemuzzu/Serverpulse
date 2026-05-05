@@ -369,15 +369,25 @@ struct LoadingCardView: View {
 
 struct ErrorCardView: View {
     let message: String
+    let isReauthing: Bool
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("CONNECTION FAILED")
-                .font(Theme.headerFont).foregroundColor(Theme.crit).kerning(1.8)
-            Text(message).font(Theme.labelFont).foregroundColor(Theme.secondary)
-            Text("Host: \(AppConfig.shared.sshHost)")
-                .font(Theme.tinyFont).foregroundColor(Theme.tertiary)
-            Text("Check Settings or Tailscale connection")
-                .font(Theme.tinyFont).foregroundColor(Theme.tertiary)
+            if isReauthing {
+                Text("AUTHENTICATING")
+                    .font(Theme.headerFont).foregroundColor(Theme.accent).kerning(1.8)
+                Text("Tailscale auth opened in browser…")
+                    .font(Theme.labelFont).foregroundColor(Theme.secondary)
+                Text("Approve the request, then monitoring resumes")
+                    .font(Theme.tinyFont).foregroundColor(Theme.tertiary)
+            } else {
+                Text("CONNECTION FAILED")
+                    .font(Theme.headerFont).foregroundColor(Theme.crit).kerning(1.8)
+                Text(message).font(Theme.labelFont).foregroundColor(Theme.secondary)
+                Text("Host: \(AppConfig.shared.sshHost)")
+                    .font(Theme.tinyFont).foregroundColor(Theme.tertiary)
+                Text("Try Re-authenticate below if Tailscale session expired")
+                    .font(Theme.tinyFont).foregroundColor(Theme.tertiary)
+            }
         }
         .frame(width: Config.cardWidth, alignment: .leading)
         .padding(.horizontal, 16).padding(.vertical, 16)
@@ -614,6 +624,74 @@ func sshTest(host: String) -> Bool {
     guard p.terminationStatus == 0 else { return false }
     let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     return out.contains("PULSE_OK")
+}
+
+// MARK: - Tailscale Re-authentication
+// Runs SSH WITHOUT BatchMode so Tailscale can print its auth URL.
+// Captures the URL from stderr and opens it in the browser automatically.
+// The SSH process blocks until the user approves in the browser, then completes.
+func reauthSSH(host: String, timeout: Int = 90, completion: @escaping (Bool) -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        p.arguments = [
+            "-o", "ConnectTimeout=30",
+            "-o", "StrictHostKeyChecking=accept-new",
+            // NO BatchMode — allows Tailscale interactive auth
+            host,
+            "echo PULSE_OK"
+        ]
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        p.standardOutput = outPipe
+        p.standardError = errPipe
+        // Provide empty stdin so SSH doesn't try to read a password
+        p.standardInput = Pipe()
+
+        var authURLOpened = false
+
+        // Read stderr asynchronously to catch the Tailscale auth URL
+        // while the process is still blocking/waiting for approval
+        errPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            // Tailscale prints: "# To authenticate, visit: https://login.tailscale.com/a/..."
+            // Find any URL containing login.tailscale.com
+            for line in text.components(separatedBy: "\n") {
+                if !authURLOpened, line.contains("tailscale.com") {
+                    // Extract the URL from the line
+                    let words = line.components(separatedBy: .whitespaces)
+                    for word in words {
+                        if word.hasPrefix("https://"), let url = URL(string: word) {
+                            authURLOpened = true
+                            DispatchQueue.main.async {
+                                NSWorkspace.shared.open(url)
+                            }
+                            break
+                        }
+                    }
+                }
+            }
+        }
+
+        do { try p.run() } catch {
+            DispatchQueue.main.async { completion(false) }
+            return
+        }
+
+        // Kill if user doesn't approve within timeout
+        let deadline = DispatchTime.now() + .seconds(timeout)
+        DispatchQueue.global().asyncAfter(deadline: deadline) {
+            if p.isRunning { p.terminate() }
+        }
+
+        p.waitUntilExit()
+        errPipe.fileHandleForReading.readabilityHandler = nil
+
+        let ok = p.terminationStatus == 0
+        DispatchQueue.main.async { completion(ok) }
+    }
 }
 
 // MARK: - Settings Window Controller
@@ -853,6 +931,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var timer: Timer?
     let pulseIcon = makePulseIcon()
     let settingsController = SettingsWindowController()
+    var isReauthing = false
 
     func applicationDidFinishLaunching(_ n: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -919,7 +998,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let h = CardHostingView(rootView: v)
             h.frame.size = h.fittingSize; cardItem.view = h
         } else if let err = monitor.lastError, err != "Not configured" {
-            let h = CardHostingView(rootView: ErrorCardView(message: err))
+            let h = CardHostingView(rootView: ErrorCardView(message: err, isReauthing: isReauthing))
             h.frame.size = h.fittingSize; cardItem.view = h
         } else {
             let h = CardHostingView(rootView: LoadingCardView())
@@ -932,6 +1011,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if AppConfig.shared.isConfigured {
             let refresh = NSMenuItem(title: "  ↻  Refresh Now", action: #selector(refreshAction), keyEquivalent: "r")
             refresh.target = self; menu.addItem(refresh)
+
+            // Show re-authenticate when connection is failing
+            if monitor.lastError != nil || isReauthing {
+                if isReauthing {
+                    let authItem = NSMenuItem(title: "  🔑  Authenticating… (check browser)", action: nil, keyEquivalent: "")
+                    authItem.isEnabled = false
+                    menu.addItem(authItem)
+                } else {
+                    let reauth = NSMenuItem(title: "  🔑  Re-authenticate (Tailscale)", action: #selector(reauthAction), keyEquivalent: "a")
+                    reauth.target = self; menu.addItem(reauth)
+                }
+            }
 
             let terminal = NSMenuItem(title: "  ⌨  Open Terminal", action: #selector(terminalAction), keyEquivalent: "t")
             terminal.target = self; menu.addItem(terminal)
@@ -973,6 +1064,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func copyIPAction() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(AppConfig.shared.serverIP, forType: .string)
+    }
+
+    @objc func reauthAction() {
+        guard !isReauthing else { return }
+        isReauthing = true
+        rebuildMenu()
+        updateTitle(loading: true)
+
+        let host = AppConfig.shared.sshHost
+        reauthSSH(host: host, timeout: 90) { [weak self] ok in
+            guard let self = self else { return }
+            self.isReauthing = false
+            if ok {
+                // Auth succeeded — restart normal monitoring
+                self.startMonitoring()
+            } else {
+                self.monitor.reset()
+                self.rebuildMenu()
+                self.updateTitle(loading: false)
+            }
+        }
     }
 
     @objc func settingsAction() { openSettings() }
